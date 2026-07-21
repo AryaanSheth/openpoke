@@ -7,7 +7,7 @@
 # aspirational — if a target is in this file it worked at least once.
 
 PY      := .venv/bin/python
-PORT    := 8099
+PORT    := 8001
 OLDPORT := 8098
 OLDTREE := /tmp/openpoke-main
 PSQL    := docker exec openpoke-postgres-1 psql -U openpoke -d openpoke -Atc
@@ -15,7 +15,7 @@ PSQL    := docker exec openpoke-postgres-1 psql -U openpoke -d openpoke -Atc
 .DEFAULT_GOAL := help
 .PHONY: help db-up db-down migrate test test-once gates token api worker \
         old-tree old-api probe-before probe-after demo demo-auto diagram \
-        preflight explain cost depth tenancy schema clean-demo nuke-old
+        preflight explain cost depth tenancy schema web clean-demo nuke-old
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -61,6 +61,12 @@ api: migrate ## Run the API in the foreground on $(PORT)
 
 worker: migrate ## Run a worker in the foreground (repeat in more shells to scale)
 	$(PY) -m server.worker
+
+web: ## Run the frontend on :3000, wired to the API with the saved token
+	@test -f .demo_token || { echo "no .demo_token — run 'make token' and save it there"; exit 1; }
+	@echo "frontend -> http://localhost:3000  (API $(PORT))"
+	@cd web && OPENPOKE_API_TOKEN=$$(cat ../.demo_token) \
+	  PY_SERVER_URL=http://localhost:$(PORT) npm run dev
 
 # --------------------------------------------------------- before/after probes
 #
@@ -109,10 +115,10 @@ demo: ## Print the live demo runbook (does NOT run anything — see demo-auto)
 	@echo "  5. make probe-before          # four bugs confirmed present"
 	@echo ""
 	@echo "  AFTER:"
-	@echo "  6. make api                   # terminal 2"
+	@echo "  6. make api                   # terminal 2 — API on $(PORT)"
 	@echo "  7. make worker                # terminal 3 (repeat for 3 workers)"
-	@echo "  8. make token                 # copy the token"
-	@echo "  9. make probe-after TOKEN=opk_...   # same four probes, all fixed"
+	@echo "  8. make web                   # terminal 4 — UI on :3000, token wired in"
+	@echo "  9. make probe-after TOKEN=\$$(cat .demo_token)"
 	@echo ""
 	@echo "  10. see docs/INTERVIEW.md for the narration and the diagram"
 	@echo ""
