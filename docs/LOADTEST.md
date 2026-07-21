@@ -231,3 +231,60 @@ grows unbounded (it isn't). If it grows unbounded, the fix named in the plan is 
 | "batching is the difference between ~1k/s and ~50k/s" (deleted, tier D) | Measured 9.4k/s (batch=1) → 163k/s (batch=100), 17.5× for a 100× batch increase — batching is real and large, not the ~50× implied by the deleted number. |
 | "`SKIP LOCKED` scales near-linearly with no lock contention" (plan.md Phase 5 step 1) | **Not confirmed.** Measured 2.4× throughput for 8× clients, then a regression at 16. No row-lock contention observed; the ceiling looks like WAL-fsync/CPU contention on this Docker VM, unconfirmed pending a bare-metal rerun. |
 | "/chat/send p95 should be single-digit ms and flat under load" (plan.md Phase 5 step 3) | p95 15-20ms and flat for 1-14 concurrent requests (close, not single-digit). **Not flat past 15** — collapses to ~30s due to an unconfigured DB connection pool, not the endpoint's own logic. |
+
+---
+
+## Soak — 30 minutes sustained (run after the first load pass)
+
+`loadtest/db/soak.sh 30 4 10` — 4 clients, batch 10, against an isolated
+`openpoke_soak` database seeded with 200k pending rows and a recycler that keeps
+the queue non-empty so claims continue for the whole run. Sampled every 30s.
+
+**Why it exists:** every claim is an `UPDATE`, so every claim leaves a dead
+tuple. A queue table is the textbook autovacuum-bloat case, and throughput that
+looks fine for 60 seconds can collapse over hours. The first load pass explicitly
+did not run this; the gap is now closed.
+
+### Result: steady state reached, autovacuum keeps pace
+
+| Metric | Value |
+|---|---|
+| Duration | 1,716s (57 samples) |
+| Dead tuples | sawtooth between **213k and 2.4M** |
+| Autovacuum runs | 27 in ~29 minutes |
+| Table size | 70MB → 136MB, then **flat at 136MB** for the final 10+ samples |
+| Dead ratio at steady state | ~88% of the table, by design |
+
+```
+t+1506s  dead=2,400,000  size=136MB
+t+1536s  dead=1,083,248  size=136MB   <- autovacuum fires
+t+1566s  dead=2,002,628  size=136MB
+t+1596s  dead=1,200,000  size=136MB   <- fires again
+```
+
+**Reading it.** Size grew during the initial fill and then stopped, holding flat
+while dead tuples cycled between roughly 1M and 2.4M. That is autovacuum
+reclaiming space *within* the table and the queue reusing it — the healthy
+outcome. Vacuum does not return pages to the OS, which is why the file stays at
+136MB rather than shrinking; only `VACUUM FULL` does that, and it takes an
+exclusive lock, so it is not an option on a live queue table.
+
+**What failure would have looked like:** `table_bytes` climbing monotonically
+across the whole run. That means reclaimed space is not being reused fast enough,
+queries begin scanning dead rows to find live ones, and throughput degrades over
+hours in a way no short benchmark shows. The fix in that case is tuning
+`autovacuum_vacuum_scale_factor` **on this table specifically** — the default only
+triggers after 20% of a table is dead, which is far too lazy for a table that sits
+at ~88% dead in normal operation.
+
+**Observed independently, and worth stating:** after the earlier 3M-row load run,
+`jobs` held **2 live rows in 528MB**. That is the same mechanism without a
+recycler draining it — and the single most vivid argument in this document for why
+a 60-second benchmark proves nothing about production.
+
+**Caveat.** One 29-minute run on Docker Desktop's virtualized VM, at one
+concurrency and one batch size. It demonstrates autovacuum can keep pace at this
+churn rate on this hardware. It does not establish a ceiling; a multi-hour run at
+peak concurrency on the target instance type is what would.
+
+Raw data: `loadtest/results_soak.csv`.
