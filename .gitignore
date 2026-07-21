@@ -44,3 +44,7 @@ server/venv/
 # Generated documentation / analysis artifacts
 server/repomix-output.txt
 server/plans/
+
+# Interview prep — intentionally local-only, never pushed.
+docs/INTERVIEW.md
+docs/SIMPLE.md
