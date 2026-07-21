@@ -1,0 +1,46 @@
+# Build context for the api/worker image (see Dockerfile). Anything not needed to run
+# `python -m server.server` / `python -m server.worker` / `alembic upgrade head` stays out.
+#
+# Secrets: `.env` in this repo is a symlink to `.env.local` (verified: `ls -la .env` shows
+# `.env -> .env.local`). Docker's default .dockerignore matcher follows symlink *names*, not
+# targets, so both the link and the real file must be listed explicitly or the target leaks
+# under the link's name. Both patterns are below.
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+server/venv/
+*.egg-info/
+
+# Env / secrets — never bake these into an image
+.env
+.env.*
+.env.local
+!.env.example
+
+# Frontend — this image is backend-only (api + worker); no web/ service is built from it
+web/
+
+# Local file-store data (pre-Postgres state, gitignored, and irrelevant to a stateless image)
+server/data/
+data/
+
+# VCS / editor / CI
+.git/
+.github/
+.gitignore
+.claude/
+
+# Caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Docs, plan, notes — not needed at runtime
+docs/
+*.md
+
+# Node
+node_modules/

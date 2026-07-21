@@ -1,11 +1,9 @@
 """Execution Agent implementation."""
 
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Dict, List, Optional
 
 from ...services.execution import get_execution_agent_logs
-from ...logging_config import logger
-
 
 # Load system prompt template from file
 _prompt_path = Path(__file__).parent / "system_prompt.md"
@@ -29,6 +27,89 @@ You have access to Gmail tools to help complete your tasks. When given instructi
 Be thorough, accurate, and efficient in your execution."""
 
 
+ELISION = "<history_elided>Older history omitted to bound prompt size.</history_elided>"
+
+
+def _entry_start_indices(lines: List[str]) -> List[int]:
+    """Line indices where a transcript entry begins.
+
+    ``render_entry`` (``repositories/formatting.py:66``) writes one entry per
+    line, but payloads are stored raw and may contain newlines — so an entry can
+    span several lines and only the first one starts with ``<``.
+    """
+    return [i for i, line in enumerate(lines) if line.startswith("<")]
+
+
+def window_transcript(
+    transcript: str,
+    *,
+    conversation_limit: Optional[int] = None,
+    char_budget: Optional[int] = None,
+) -> str:
+    """Bound a per-agent transcript, tail-preserving.
+
+    **Why this exists.** ``ExecutionAgentRuntime`` built ``ExecutionAgent(name)``
+    with no limit, so ``conversation_limit`` defaulted to ``None`` and the entire
+    per-agent log went into the system prompt on every call. A trigger agent
+    firing every 5 minutes appends ~1KB per fire; by day 3 its system prompt is
+    ~200k tokens, and shortly after that it exceeds the context window and
+    **every call fails permanently**. A fuse, not a curve.
+
+    **Why tail-preserving, and why the head is kept anyway.** Truncation makes an
+    agent forget what it has already done, and an agent that has forgotten a
+    completed action can repeat it — re-sending a real email. Keeping the tail
+    preserves recent actions, which is where that risk concentrates. The *first*
+    request is kept regardless, because it is the original task instruction: drop
+    it and the agent no longer knows what it was asked to do, which is a worse
+    failure than forgetting a middle step.
+
+    # ponytail: truncation caps prompt growth; summarize agent history if recall
+    # suffers.
+    """
+    lines = transcript.split("\n")
+    starts = _entry_start_indices(lines)
+    requests = [i for i in starts if lines[i].startswith("<agent_request")]
+
+    head_lines: List[str] = []
+    tail_start = 0
+
+    # 1. Window by request count, keeping the first request (the original task).
+    if conversation_limit and conversation_limit > 0 and len(requests) > conversation_limit:
+        tail_start = requests[-conversation_limit]
+        first = requests[0]
+        following = [i for i in starts if i > first]
+        head_lines = lines[first : (following[0] if following else len(lines))]
+
+    # 2. Then drop whole entries off the front of the tail until it fits the
+    #    budget. Entry boundaries, not characters, so a truncated prompt never
+    #    contains half an XML tag.
+    if char_budget and char_budget > 0:
+        overhead = sum(len(line) + 1 for line in head_lines) + len(ELISION) + 1
+        for start in starts:
+            if start < tail_start:
+                continue
+            if overhead + sum(len(line) + 1 for line in lines[start:]) <= char_budget:
+                tail_start = start
+                break
+        else:
+            tail_start = starts[-1] if starts else 0
+
+    head_text = "\n".join([*head_lines, ELISION]) if tail_start > 0 else ""
+    tail_text = "\n".join(lines[tail_start:])
+
+    # 3. Hard clamp, so the budget is a guarantee rather than a best effort.
+    #    Only the tail is clamped: losing the original task instruction is the
+    #    one truncation that actually changes what the agent believes it is
+    #    doing. If a *single* entry exceeds the whole budget the head still wins
+    #    — pick a budget larger than one realistic entry.
+    if char_budget and char_budget > 0:
+        room = max(char_budget - len(head_text) - 1, 0)
+        if len(tail_text) > room:
+            tail_text = tail_text[-room:]
+
+    return "\n".join(part for part in (head_text, tail_text) if part).strip()
+
+
 class ExecutionAgent:
     """Manages state and history for an execution agent."""
 
@@ -36,17 +117,20 @@ class ExecutionAgent:
     def __init__(
         self,
         name: str,
-        conversation_limit: Optional[int] = None
+        conversation_limit: Optional[int] = None,
+        history_char_budget: Optional[int] = None,
     ):
         """
         Initialize an execution agent.
 
         Args:
             name: Human-readable agent name (e.g., 'conversation with keith')
-            conversation_limit: Optional limit on past conversations to include (None = all)
+            conversation_limit: Max recent agent requests to keep (None = all — unbounded)
+            history_char_budget: Hard ceiling on the rendered history block
         """
         self.name = name
         self.conversation_limit = conversation_limit
+        self.history_char_budget = history_char_budget
         self._log_store = get_execution_agent_logs()
 
     # Generate system prompt template with agent name and purpose derived from name
@@ -69,31 +153,16 @@ class ExecutionAgent:
         """
         base_prompt = self.build_system_prompt()
 
-        # Load history transcript
         transcript = self._log_store.load_transcript(self.name)
+        if not transcript:
+            return base_prompt
 
-        if transcript:
-            # Apply conversation limit if needed
-            if self.conversation_limit and self.conversation_limit > 0:
-                # Parse entries and limit them
-                lines = transcript.split('\n')
-                request_count = sum(1 for line in lines if '<agent_request' in line)
-
-                if request_count > self.conversation_limit:
-                    # Find where to cut
-                    kept_requests = 0
-                    cutoff_index = len(lines)
-                    for i in range(len(lines) - 1, -1, -1):
-                        if '<agent_request' in lines[i]:
-                            kept_requests += 1
-                            if kept_requests == self.conversation_limit:
-                                cutoff_index = i
-                                break
-                    transcript = '\n'.join(lines[cutoff_index:])
-
-            return f"{base_prompt}\n\n# Execution History\n\n{transcript}"
-
-        return base_prompt
+        transcript = window_transcript(
+            transcript,
+            conversation_limit=self.conversation_limit,
+            char_budget=self.history_char_budget,
+        )
+        return f"{base_prompt}\n\n# Execution History\n\n{transcript}"
 
     # Format current instruction as user message for LLM consumption
     def build_messages_for_llm(self, current_instruction: str) -> List[Dict[str, str]]:

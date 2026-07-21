@@ -1,0 +1,49 @@
+{
+  "scenario": "important_email_arrival",
+  "description": "An email arrives that the classifier marks important. The watcher (server/services/gmail/importance_watcher.py::_poll_tenant) calls classify_email_importance, which issues one LLM call against the mark_email_importance tool schema. On a decided+summarized verdict the watcher awaits _dispatch_summary, which calls InteractionAgentRuntime.handle_agent_message -- a second LLM call that relays the summary to the user via send_message_to_user.",
+  "email": {
+    "id": "important-1",
+    "sender": "airline@example.test",
+    "subject": "Your flight has been cancelled",
+    "clean_text": "Flight AB123 on 2026-07-22 has been cancelled. Please rebook."
+  },
+  "turns": [
+    {
+      "agent": "classifier",
+      "model_setting": "email_classifier_model",
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "mark_email_importance",
+          "arguments": {
+            "important": true,
+            "summary": "Your flight AB123 on 2026-07-22 was cancelled; you need to rebook."
+          }
+        }
+      ]
+    },
+    {
+      "agent": "interaction",
+      "model_setting": "interaction_agent_model",
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "send_message_to_user",
+          "arguments": {
+            "message": "Heads up: your flight AB123 on 2026-07-22 was cancelled. You'll need to rebook."
+          }
+        }
+      ]
+    },
+    {
+      "agent": "interaction",
+      "model_setting": "interaction_agent_model",
+      "content": "",
+      "tool_calls": []
+    }
+  ],
+  "expected_tool_sequence": [
+    {"agent": "classifier", "tool": "mark_email_importance"},
+    {"agent": "interaction", "tool": "send_message_to_user"}
+  ]
+}

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List
 
-from . import gmail, triggers
 from ..tasks import get_task_registry, get_task_schemas
+from . import gmail, triggers
 
 
 # Return OpenAI/OpenRouter-compatible tool schemas

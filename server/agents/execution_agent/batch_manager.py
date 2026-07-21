@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from .runtime import ExecutionAgentRuntime, ExecutionResult
 from ...logging_config import logger
+from .runtime import ExecutionAgentRuntime, ExecutionResult
 
 
 @dataclass

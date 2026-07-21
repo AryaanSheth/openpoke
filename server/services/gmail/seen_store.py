@@ -1,119 +1,55 @@
-"""Persistence helper for tracking recently processed Gmail message IDs."""
+"""Ledger of Gmail message ids already handled, per tenant.
+
+Was ``data/gmail_seen.json`` — a single bounded deque shared by every user, so
+one tenant's poll could mark another tenant's message id as handled.
+
+The only consumer is the importance watcher, which is async and owned by this
+phase, so this is a thin async wrapper over ``GmailSeenRepository`` rather than a
+sync bridge proxy. The class name is kept because
+``services/gmail/__init__.py`` and ``services/__init__.py`` re-export it.
+"""
 
 from __future__ import annotations
 
-import json
-import threading
-from collections import deque
-from pathlib import Path
-from typing import Deque, Iterable, List, Optional, Set
+import uuid
+from collections.abc import Iterable
 
-from ...logging_config import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...repositories.gmail import CLASSIFY_RETRY_BUDGET, GmailSeenRepository
 
 
 class GmailSeenStore:
-    """Maintain a bounded set of Gmail message IDs backed by a JSON file."""
+    """Tenant-scoped seen ledger.
 
-    def __init__(self, path: Path, max_entries: int = 300) -> None:
-        self._path = path
-        self._max_entries = max_entries
-        self._lock = threading.Lock()
-        self._entries: Deque[str] = deque()
-        self._index: Set[str] = set()
-        self._load()
+    ``classified=False`` records an *attempt*; only ``classified=True`` is a
+    verdict. That distinction is what stops a transient OpenRouter failure from
+    dropping an email permanently — see ``importance_watcher.py``.
+    """
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def has_entries(self) -> bool:
-        with self._lock:
-            return bool(self._entries)
+    def __init__(self, session: AsyncSession, user_id: uuid.UUID) -> None:
+        self._repo = GmailSeenRepository(session, user_id)
 
-    def is_seen(self, message_id: str) -> bool:
-        normalized = self._normalize(message_id)
-        if not normalized:
-            return False
-        with self._lock:
-            return normalized in self._index
+    async def unprocessed(self, message_ids: Iterable[str]) -> list[str]:
+        return await self._repo.unprocessed(message_ids)
 
-    def mark_seen(self, message_ids: Iterable[str]) -> None:
-        normalized_ids = [mid for mid in (self._normalize(mid) for mid in message_ids) if mid]
-        if not normalized_ids:
-            return
+    async def mark_classified(self, message_ids: Iterable[str]) -> int:
+        """Record a verdict. These ids are done."""
+        return await self._repo.mark(message_ids, classified=True)
 
-        with self._lock:
-            for message_id in normalized_ids:
-                if message_id in self._index:
-                    # Refresh recency by removing and re-appending
-                    try:
-                        self._entries.remove(message_id)
-                    except ValueError:  # pragma: no cover - defensive
-                        pass
-                else:
-                    self._index.add(message_id)
-                self._entries.append(message_id)
+    async def mark_attempted(self, message_ids: Iterable[str]) -> int:
+        """Record an attempt. Eligible for retry until the budget expires."""
+        return await self._repo.mark(message_ids, classified=False)
 
-            self._prune_locked()
-            self._persist_locked()
+    async def expire_stale(self) -> list[str]:
+        """Settle attempts older than the retry budget so they stop retrying."""
+        return await self._repo.expire_stale()
 
-    def snapshot(self) -> List[str]:
-        with self._lock:
-            return list(self._entries)
+    async def is_seen(self, message_id: str) -> bool:
+        return await self._repo.is_seen(message_id)
 
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-            self._index.clear()
-            self._persist_locked()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _normalize(self, message_id: Optional[str]) -> str:
-        if not message_id:
-            return ""
-        return str(message_id).strip()
-
-    def _load(self) -> None:
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "Failed to load Gmail seen-store; starting empty",
-                extra={"path": str(self._path), "error": str(exc)},
-            )
-            return
-
-        if not isinstance(data, list):
-            logger.warning(
-                "Gmail seen-store payload invalid; expected list",
-                extra={"path": str(self._path)},
-            )
-            return
-
-        for raw_id in data[-self._max_entries :]:
-            normalized = self._normalize(raw_id)
-            if normalized and normalized not in self._index:
-                self._entries.append(normalized)
-                self._index.add(normalized)
-
-    def _prune_locked(self) -> None:
-        while len(self._entries) > self._max_entries:
-            oldest = self._entries.popleft()
-            self._index.discard(oldest)
-
-    def _persist_locked(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = list(self._entries)
-            self._path.write_text(json.dumps(payload), encoding="utf-8")
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "Failed to persist Gmail seen-store",
-                extra={"path": str(self._path), "error": str(exc)},
-            )
+    async def clear(self) -> None:
+        await self._repo.clear()
 
 
-__all__ = ["GmailSeenStore"]
+__all__ = ["CLASSIFY_RETRY_BUDGET", "GmailSeenStore"]

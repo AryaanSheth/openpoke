@@ -1,0 +1,303 @@
+# CI gate sequence, per plan.md "Phase 6 — Deploy shape + CI/CD":
+#
+#   lint (ruff) -> typecheck (mypy) -> test (unit + integration, postgres:16)
+#     -> migrations (upgrade head on empty DB, then drift check)
+#     -> behavioral (recorded-fixture tool-call sequences)
+#     -> load smoke (k6, p95 threshold)
+#     -> gitleaks
+#
+# Jobs run in that order via `needs:` so a cheap failure (lint) fails fast before a
+# postgres service container is even spun up. The three gates that catch what lint
+# never will: migration drift (model changed, migration didn't), behavioral fixtures
+# (a prompt edit silently changed which tool the agent calls), and the k6 threshold
+# (a regression that's correct but 10x slower).
+#
+# `unit` and `integration` are one job (`test`) below, not two. Reason: every test in
+# this repo runs through tests/conftest.py's session-scoped, autouse `_migrated_database`
+# fixture, which requires a real Postgres connection before a single test executes -
+# there is currently no marker or directory split that separates DB-free unit tests from
+# DB-backed integration tests. Splitting the job without that split existing in the test
+# suite would either run zero tests under a misleading "unit" label or fail every "unit"
+# run on a missing database. Once tests/ grows a `@pytest.mark.unit` (or equivalent) for
+# pure-logic tests, split this back into two jobs — that's a tests/ (Phase 4) change, not
+# a workflow change.
+#
+# `behavioral` and `load-smoke` arm themselves: each checks for its own artifact at
+# runtime and runs for real if present, or skips cleanly with a named reason if not.
+# See the comments on each job for exactly what has to land to arm it permanently.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      - name: ruff check
+        run: ruff check .
+
+  typecheck:
+    name: typecheck (mypy)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      # No args: mypy reads `[tool.mypy] files = ["server/db", "server/config.py"]` and
+      # the per-module `ignore_errors` overrides from pyproject.toml. Do not add flags
+      # here to broaden or narrow scope - that's a pyproject.toml decision, owned by
+      # Phase 0, not a workflow one.
+      - name: mypy
+        run: mypy
+
+  test:
+    name: test (unit + integration - postgres:16)
+    needs: typecheck
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: openpoke
+          POSTGRES_PASSWORD: openpoke
+          POSTGRES_DB: openpoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openpoke -d openpoke"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@localhost:5432/openpoke
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      # tests/conftest.py migrates the DB to head itself (session-scoped autouse
+      # fixture) before any test runs, so no separate "run migrations" step belongs
+      # here - see the `migrations` job below for the dedicated drift gate.
+      - name: pytest
+        run: python -m pytest -v
+
+  migrations:
+    name: migrations (alembic upgrade head, then drift check)
+    needs: test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: openpoke
+          POSTGRES_PASSWORD: openpoke
+          POSTGRES_DB: openpoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openpoke -d openpoke"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@localhost:5432/openpoke
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      # Service containers are provisioned fresh per job, so this DB is genuinely
+      # empty - this is the "upgrade head on empty DB" leg of the gate.
+      - name: alembic upgrade head
+        run: alembic upgrade head
+      # Fails the build on drift: a model changed and the migration didn't.
+      # `alembic check` is the modern equivalent of `alembic revision --autogenerate
+      # --check` (Alembic >=1.13) - same comparison, one command, no throwaway
+      # revision file to generate and diff.
+      - name: alembic check (drift gate)
+        run: alembic check
+
+  behavioral:
+    name: behavioral (recorded-fixture tool-call sequences)
+    needs: migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: openpoke
+          POSTGRES_PASSWORD: openpoke
+          POSTGRES_DB: openpoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openpoke -d openpoke"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@localhost:5432/openpoke
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      - name: Check for behavioral fixtures
+        id: check
+        run: |
+          if [ -f tests/test_behavioral.py ] && [ -d tests/fixtures ] && [ -n "$(ls -A tests/fixtures 2>/dev/null)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run behavioral fixtures
+        if: steps.check.outputs.present == 'true'
+        run: python -m pytest tests/test_behavioral.py -v
+      - name: Skip - fixtures not present
+        if: steps.check.outputs.present == 'false'
+        run: |
+          echo "::warning::Skipping behavioral gate: tests/test_behavioral.py or tests/fixtures/ not found."
+          echo "This gate arms itself automatically once both exist - no workflow change needed."
+          echo "What has to land (plan.md Phase 4, test_behavioral.py): recorded LLM-response"
+          echo "fixtures replayed through the conftest.py 'llm' stub, asserting the tool-call"
+          echo "sequence for (1) 'remind me tomorrow at 9' and (2) an important-email arrival."
+          echo "This is the regression net for prompt/model changes; a prompt edit that silently"
+          echo "changes which tool the agent calls is otherwise invisible to lint/typecheck/unit."
+
+  load-smoke:
+    name: load smoke (k6, p95 threshold)
+    needs: behavioral
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: openpoke
+          POSTGRES_PASSWORD: openpoke
+          POSTGRES_DB: openpoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openpoke -d openpoke"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@localhost:5432/openpoke
+      # /chat/send is a pure enqueue, so this measures our endpoint rather than
+      # OpenRouter. The worker is deliberately NOT started: jobs pile up in the
+      # queue and are never executed, which is exactly what we want to measure.
+      OPENROUTER_API_KEY: ci-not-used-chat-send-only-enqueues
+      COMPOSIO_API_KEY: ci-not-used
+      COMPOSIO_GMAIL_AUTH_CONFIG_ID: ci-not-used
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check for a k6 load script
+        id: check
+        run: |
+          script=$(find . -path ./web/node_modules -prune -o -path ./.venv -prune -o \
+            -iname "*.js" -path "*load*" -print 2>/dev/null | grep -iE 'k6|load' | head -1)
+          if [ -n "$script" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "script=$script" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v7
+        if: steps.check.outputs.present == 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        if: steps.check.outputs.present == 'true'
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      - name: Migrate and start the API
+        if: steps.check.outputs.present == 'true'
+        id: stack
+        run: |
+          python -m alembic upgrade head
+          # The token is minted here and only here: it never leaves the runner,
+          # and the account is thrown away with the container.
+          TOKEN=$(python -m server.auth create-user --email ci-load@example.invalid \
+                  | awk '/token:/{print $2}')
+          [ -n "$TOKEN" ] || { echo "::error::could not mint a bearer token"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          python -m uvicorn server.app:app --port 8098 > /tmp/api.log 2>&1 &
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8098/api/v1/health || true)
+            [ "$code" = "200" ] && { echo "api up after ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::API did not become healthy"; cat /tmp/api.log; exit 1
+      - name: Install k6
+        if: steps.check.outputs.present == 'true'
+        uses: grafana/setup-k6-action@v1
+      - name: Execute k6 script
+        if: steps.check.outputs.present == 'true'
+        env:
+          BASE_URL: http://127.0.0.1:8098
+          TOKEN: ${{ steps.stack.outputs.token }}
+        run: k6 run ${{ steps.check.outputs.script }}
+      - name: API log on failure
+        if: failure() && steps.check.outputs.present == 'true'
+        run: tail -50 /tmp/api.log
+      - name: Skip - k6 script not present
+        if: steps.check.outputs.present == 'false'
+        run: |
+          echo "::warning::Skipping load-smoke gate: no k6 script found in the repo."
+          echo "This gate arms itself automatically once one exists - no workflow change needed."
+          echo "What has to land (plan.md Phase 5 step 3): a k6 script driving POST /api/v1/chat/send"
+          echo "(now a pure enqueue against the jobs table) with thresholds p95 < 100ms and"
+          echo "error rate < 1%, defined inside the script via k6 'thresholds' so a slow-but-correct"
+          echo "regression fails the build. It needs a running api container ahead of it (build"
+          echo "image -> run migrations -> start api) which this job does not yet provision."
+
+  gitleaks:
+    name: gitleaks
+    needs: load-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

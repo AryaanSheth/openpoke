@@ -1,3 +1,11 @@
+// Injected by the tenancy work: the Python API now requires a bearer token on every
+// route. This proxy runs server-side, so the token stays out of the browser — it must
+// NEVER be added to a Response's headers, only to outbound fetch() calls.
+function authHeaders(): Record<string, string> {
+  const t = process.env.OPENPOKE_API_TOKEN;
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
 export const runtime = 'nodejs';
 
 export async function POST(req: Request) {
@@ -14,7 +22,7 @@ export async function POST(req: Request) {
   try {
     const resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...authHeaders() },
       body: JSON.stringify({ user_id: userId, auth_config_id: authConfigId }),
     });
     const data = await resp.json().catch(() => ({}));

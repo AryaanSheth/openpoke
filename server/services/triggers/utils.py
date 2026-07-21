@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
 from dateutil.rrule import rrulestr
-from zoneinfo import ZoneInfo
 
 from ...logging_config import logger
-
 
 UTC = timezone.utc
 DEFAULT_STATUS = "active"

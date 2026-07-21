@@ -1,0 +1,89 @@
+{
+  "scenario": "remind_me_tomorrow_at_9",
+  "description": "User asks to be reminded tomorrow at 9am. Sequence verified by driving the real runtime with this exact fixture (tests/test_behavioral.py), not assumed from reading code alone -- an earlier draft assumed the interaction agent's execute() call ends after one LLM round, but InteractionAgentRuntime._run_interaction_loop always issues one more call after any tool round to obtain a no-tool-call response that breaks its own loop (the same pattern ExecutionAgentRuntime.execute uses). Six LLM calls total: interaction (send_message_to_user + send_message_to_agent in one round-trip, per system_prompt.md's 'always let the user know what you're about to do before calling this tool'), interaction's loop-closing call, execution agent's createTrigger round, execution agent's loop-closing call, the interaction agent's handle_agent_message relay (send_message_to_user again, summarizing the execution agent's result), and its loop-closing call.",
+  "user_message": "Remind me tomorrow at 9am to call the vet.",
+  "turns": [
+    {
+      "agent": "interaction",
+      "call_purpose": "execute() round 1 -- acknowledge the user, then delegate",
+      "model_setting": "interaction_agent_model",
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "send_message_to_user",
+          "arguments": {
+            "message": "On it — I'll get that reminder set for tomorrow at 9am."
+          }
+        },
+        {
+          "name": "send_message_to_agent",
+          "arguments": {
+            "agent_name": "Vet Reminder",
+            "instructions": "Create a reminder to call the vet tomorrow at 9am."
+          }
+        }
+      ]
+    },
+    {
+      "agent": "interaction",
+      "call_purpose": "execute() round 2 -- no more tool calls, closes the loop",
+      "model_setting": "interaction_agent_model",
+      "content": "",
+      "tool_calls": []
+    },
+    {
+      "agent": "execution",
+      "call_purpose": "execution agent round 1 -- create the trigger",
+      "model_setting": "execution_agent_model",
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "createTrigger",
+          "arguments": {
+            "payload": "Call the vet",
+            "start_time": "2026-07-22T09:00:00",
+            "status": "active"
+          }
+        }
+      ]
+    },
+    {
+      "agent": "execution",
+      "call_purpose": "execution agent round 2 -- no more tool calls, closes the loop",
+      "model_setting": "execution_agent_model",
+      "content": "I've created a reminder to call the vet tomorrow at 9am.",
+      "tool_calls": []
+    },
+    {
+      "agent": "interaction",
+      "call_purpose": "handle_agent_message() round 1 -- relay the execution agent's result",
+      "model_setting": "interaction_agent_model",
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "send_message_to_user",
+          "arguments": {
+            "message": "Done — I'll remind you to call the vet tomorrow at 9am."
+          }
+        }
+      ]
+    },
+    {
+      "agent": "interaction",
+      "call_purpose": "handle_agent_message() round 2 -- no more tool calls, closes the loop",
+      "model_setting": "interaction_agent_model",
+      "content": "",
+      "tool_calls": []
+    }
+  ],
+  "expected_tool_sequence": [
+    {"agent": "interaction", "tool": "send_message_to_user"},
+    {"agent": "interaction", "tool": "send_message_to_agent"},
+    {"agent": "execution", "tool": "createTrigger"},
+    {"agent": "interaction", "tool": "send_message_to_user"}
+  ],
+  "expected_trigger": {
+    "payload": "Call the vet",
+    "status": "active"
+  }
+}

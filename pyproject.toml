@@ -1,0 +1,62 @@
+[project]
+name = "openpoke"
+version = "0.3.0"
+description = "OpenPoke server"
+requires-python = ">=3.10"
+# Runtime dependencies are pinned in server/requirements.txt (single source of truth);
+# duplicating them here would create two places to drift.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.15.22",
+    "mypy==2.3.0",
+]
+
+[tool.setuptools]
+packages = ["server"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Session-scoped loop so the session-scoped engine and the per-test session share one.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+# ponytail: UP (pyupgrade) is off because the pre-existing tree predates it — enabling it
+# reports ~330 style-only findings across files no phase touched, which would bury the
+# architectural diff and make the CI lint gate red on arrival. E/F/I/B catch real defects.
+# Re-enable UP and run `ruff check --fix` as a standalone modernization commit.
+select = ["E", "F", "I", "B"]
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+files = ["server/db", "server/config.py"]
+
+# ponytail: only Phase 0's code is gated today. The pre-existing tree has 16 real
+# type errors (two of them genuine runtime bugs — see docs/phase-0-notes.md);
+# fixing them belongs to the phases that own those files. Delete an entry here as
+# its owner cleans it up.
+[[tool.mypy.overrides]]
+module = [
+    "server.agents.*",
+    "server.app",
+    "server.logging_config",
+    "server.models.*",
+    "server.openrouter_client.*",
+    "server.routes.*",
+    "server.server",
+    "server.services.*",
+    "server.utils.*",
+]
+ignore_errors = true

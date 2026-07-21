@@ -1,25 +1,47 @@
-"""Background watcher that surfaces important Gmail emails proactively."""
+"""Background watcher that surfaces important Gmail emails proactively.
+
+**What was wrong.** One watcher read one process global for the Composio identity
+(original ``:113``: ``composio_user_id = get_active_gmail_user_id()``) and wrote
+every result into the one shared conversation log. With two users that is not a
+bug you can paper over — it is the absence of tenancy.
+
+**What it does now.** Each poll enumerates the actively connected tenants from
+``gmail_connections``, and for each one binds that tenant's context, polls Gmail
+with *that user's* Composio identity, and dispatches into *that user's*
+conversation. Per-poll state (warmup flag, last poll time) is keyed by
+``user_id`` instead of being a single instance attribute.
+
+**And the drop bug.** The old loop appended every id to ``processed_ids`` before
+checking the classifier result (original ``:200-210``), so a transient OpenRouter
+failure marked the email seen forever. Ids are now settled only on a decided
+classification; a failed attempt is recorded as an attempt and stays eligible
+until ``CLASSIFY_RETRY_BUDGET`` expires, which is what stops a poison message
+from retrying without bound.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
-from .client import execute_gmail_tool, get_active_gmail_user_id
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...db.engine import get_sessionmaker
+from ...logging_config import logger
+from ...repositories.context import TenantContext, tenant_scope
+from ...repositories.gmail import list_connected
+from .client import execute_gmail_tool_async
+from .importance_classifier import classify_email_importance
 from .processing import EmailTextCleaner, ProcessedEmail, parse_gmail_fetch_response
 from .seen_store import GmailSeenStore
-from .importance_classifier import classify_email_importance
-from ...logging_config import logger
-from ...utils.timezones import convert_to_user_timezone
-
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...agents.interaction_agent.runtime import InteractionAgentRuntime
 
 
-def _resolve_interaction_runtime() -> "InteractionAgentRuntime":
+def _resolve_interaction_runtime() -> InteractionAgentRuntime:
     from ...agents.interaction_agent.runtime import InteractionAgentRuntime
 
     return InteractionAgentRuntime()
@@ -28,49 +50,49 @@ def _resolve_interaction_runtime() -> "InteractionAgentRuntime":
 DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 DEFAULT_LOOKBACK_MINUTES = 10
 DEFAULT_MAX_RESULTS = 50
-DEFAULT_SEEN_LIMIT = 300
-
-
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-_DEFAULT_SEEN_PATH = _DATA_DIR / "gmail_seen.json"
 
 
 class ImportantEmailWatcher:
-    """Poll Gmail for recent messages and surface important ones."""
+    """Poll every connected tenant's Gmail and surface important messages."""
 
     def __init__(
         self,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         lookback_minutes: int = DEFAULT_LOOKBACK_MINUTES,
         *,
-        seen_store: Optional[GmailSeenStore] = None,
+        sessionmaker=None,
     ) -> None:
         self._poll_interval = poll_interval_seconds
         self._lookback_minutes = lookback_minutes
         self._lock = asyncio.Lock()
-        self._task: Optional[asyncio.Task[None]] = None
+        self._task: asyncio.Task[None] | None = None
         self._running = False
-        self._seen_store = seen_store or GmailSeenStore(_DEFAULT_SEEN_PATH, DEFAULT_SEEN_LIMIT)
         self._cleaner = EmailTextCleaner(max_url_length=60)
-        self._has_seeded_initial_snapshot = False
-        self._last_poll_timestamp: Optional[datetime] = None
+        self._sessionmaker = sessionmaker
+        # Per-tenant poll state. Was a pair of instance attributes describing
+        # "the" user, which is exactly the bug.
+        self._seeded: set[uuid.UUID] = set()
+        self._last_poll: dict[uuid.UUID, datetime] = {}
 
-    # Start the background email polling task
+    # -- lifecycle -------------------------------------------------------
+
     async def start(self) -> None:
         async with self._lock:
             if self._task and not self._task.done():
                 return
             loop = asyncio.get_running_loop()
             self._running = True
-            self._has_seeded_initial_snapshot = False
-            self._last_poll_timestamp = None
+            self._seeded.clear()
+            self._last_poll.clear()
             self._task = loop.create_task(self._run(), name="important-email-watcher")
             logger.info(
                 "Important email watcher started",
-                extra={"interval_seconds": self._poll_interval, "lookback_minutes": self._lookback_minutes},
+                extra={
+                    "interval_seconds": self._poll_interval,
+                    "lookback_minutes": self._lookback_minutes,
+                },
             )
 
-    # Stop the background email polling task gracefully
     async def stop(self) -> None:
         async with self._lock:
             self._running = False
@@ -88,150 +110,197 @@ class ImportantEmailWatcher:
         try:
             while self._running:
                 try:
-                    await self._poll_once()
+                    await self.poll_once()
                 except Exception as exc:  # pragma: no cover - defensive
-                    logger.exception("Important email watcher poll failed", extra={"error": str(exc)})
+                    logger.exception(
+                        "Important email watcher poll failed", extra={"error": str(exc)}
+                    )
                 await asyncio.sleep(self._poll_interval)
         except asyncio.CancelledError:
             raise
 
-    # Poll Gmail once for new messages and classify them for importance
-    def _complete_poll(self, user_now: datetime) -> None:
-        self._last_poll_timestamp = user_now
-        self._has_seeded_initial_snapshot = True
+    # -- polling ---------------------------------------------------------
 
-    async def _poll_once(self) -> None:
-        poll_started_at = datetime.now(timezone.utc)
-        user_now = convert_to_user_timezone(poll_started_at)
-        first_poll = not self._has_seeded_initial_snapshot
-        previous_poll_timestamp = self._last_poll_timestamp
-        interval_cutoff = user_now - timedelta(seconds=self._poll_interval)
-        cutoff_time = interval_cutoff
-        if previous_poll_timestamp is not None and previous_poll_timestamp > interval_cutoff:
-            cutoff_time = previous_poll_timestamp
+    def _session(self) -> AsyncSession:
+        maker = self._sessionmaker or get_sessionmaker()
+        return maker()
 
-        composio_user_id = get_active_gmail_user_id()
-        if not composio_user_id:
-            logger.debug("Gmail not connected; skipping importance poll")
-            return
+    async def poll_once(self) -> int:
+        """Poll every connected tenant. Returns the number of tenants polled."""
+        async with self._session() as session:
+            tenants = await list_connected(session)
+
+        if not tenants:
+            logger.debug("No Gmail connections; skipping importance poll")
+            return 0
+
+        for user_id, composio_user_id, timezone_name in tenants:
+            ctx = TenantContext(
+                user_id=user_id,
+                timezone=timezone_name,
+                composio_user_id=composio_user_id,
+            )
+            try:
+                with tenant_scope(ctx):
+                    await self._poll_tenant(ctx)
+            except Exception as exc:  # pragma: no cover - defensive
+                # One tenant's failure must not stop the others.
+                logger.warning(
+                    "Important email poll failed for tenant",
+                    extra={"user_id": str(user_id), "error": str(exc)},
+                )
+        return len(tenants)
+
+    async def _poll_tenant(self, ctx: TenantContext) -> None:
+        now = datetime.now(timezone.utc)
+        first_poll = ctx.user_id not in self._seeded
+        previous = self._last_poll.get(ctx.user_id)
+        interval_cutoff = now - timedelta(seconds=self._poll_interval)
+        cutoff_time = previous if previous and previous > interval_cutoff else interval_cutoff
 
         query = f"label:INBOX newer_than:{self._lookback_minutes}m"
-        arguments = {
-            "query": query,
-            "include_payload": True,
-            "max_results": DEFAULT_MAX_RESULTS,
-        }
-
         try:
-            raw_result = execute_gmail_tool("GMAIL_FETCH_EMAILS", composio_user_id, arguments=arguments)
+            raw_result = await execute_gmail_tool_async(
+                "GMAIL_FETCH_EMAILS",
+                ctx.composio_user_id or "",
+                arguments={
+                    "query": query,
+                    "include_payload": True,
+                    "max_results": DEFAULT_MAX_RESULTS,
+                },
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to fetch Gmail messages for watcher",
-                extra={"error": str(exc)},
+                extra={"user_id": str(ctx.user_id), "error": str(exc)},
             )
             return
 
         processed_emails, _ = parse_gmail_fetch_response(
-            raw_result,
-            query=query,
-            cleaner=self._cleaner,
+            raw_result, query=query, cleaner=self._cleaner
         )
 
-        if not processed_emails:
-            logger.debug("No recent Gmail messages found for watcher")
-            self._complete_poll(user_now)
-            return
+        async with self._session() as session:
+            seen = GmailSeenStore(session, ctx.user_id)
 
-        if first_poll:
-            self._seen_store.mark_seen(email.id for email in processed_emails)
-            logger.info(
-                "Important email watcher completed initial warmup",
-                extra={"skipped_ids": len(processed_emails)},
-            )
-            self._complete_poll(user_now)
-            return
+            expired = await seen.expire_stale()
+            if expired:
+                # Loud on purpose: these are messages we never managed to
+                # classify inside the retry budget. Ids only, never bodies.
+                logger.error(
+                    "Gmail messages abandoned after exhausting the classify retry budget",
+                    extra={"user_id": str(ctx.user_id), "message_ids": expired},
+                )
 
-        unseen_emails: List[ProcessedEmail] = [
-            email for email in processed_emails if not self._seen_store.is_seen(email.id)
-        ]
+            if not processed_emails:
+                await session.commit()
+                self._complete(ctx.user_id, now)
+                return
 
-        if not unseen_emails:
-            logger.info(
-                "Important email watcher check complete",
-                extra={"emails_reviewed": 0, "surfaced": 0},
-            )
-            self._complete_poll(user_now)
-            return
+            if first_poll:
+                # Warmup: everything already in the inbox is pre-existing, not new.
+                await seen.mark_classified(email.id for email in processed_emails)
+                await session.commit()
+                logger.info(
+                    "Important email watcher completed initial warmup",
+                    extra={"user_id": str(ctx.user_id), "skipped_ids": len(processed_emails)},
+                )
+                self._complete(ctx.user_id, now)
+                return
 
-        unseen_emails.sort(key=lambda email: email.timestamp or datetime.now(timezone.utc))
+            pending_ids = set(await seen.unprocessed(email.id for email in processed_emails))
+            unseen = [email for email in processed_emails if email.id in pending_ids]
 
-        eligible_emails: List[ProcessedEmail] = []
-        aged_emails: List[ProcessedEmail] = []
+            if not unseen:
+                await session.commit()
+                logger.info(
+                    "Important email watcher check complete",
+                    extra={"user_id": str(ctx.user_id), "emails_reviewed": 0, "surfaced": 0},
+                )
+                self._complete(ctx.user_id, now)
+                return
 
-        for email in unseen_emails:
-            email_timestamp = email.timestamp
-            if email_timestamp.tzinfo is not None:
-                email_timestamp = email_timestamp.astimezone(user_now.tzinfo)
-            else:
-                email_timestamp = email_timestamp.replace(tzinfo=user_now.tzinfo)
+            unseen.sort(key=lambda email: email.timestamp or now)
+            eligible, aged = self._split_by_age(unseen, cutoff_time)
 
-            if email_timestamp < cutoff_time:
-                aged_emails.append(email)
-                continue
+            # Aged-out messages get a verdict of "too old to surface" — that is a
+            # decision, so settling them is correct.
+            if aged:
+                await seen.mark_classified(email.id for email in aged)
 
-            eligible_emails.append(email)
+            surfaced = 0
+            failed = 0
+            summaries: list[str] = []
+            for email in eligible:
+                result = await classify_email_importance(email)
+                if not result.decided:
+                    # No verdict: record the attempt so the retry budget starts
+                    # ticking, but leave the message eligible for another pass.
+                    await seen.mark_attempted([email.id])
+                    failed += 1
+                    continue
+                await seen.mark_classified([email.id])
+                if result.summary:
+                    summaries.append(result.summary)
+                    surfaced += 1
 
-        if not eligible_emails and aged_emails:
-            self._seen_store.mark_seen(email.id for email in aged_emails)
-            logger.info(
-                "Important email watcher check complete",
-                extra={
-                    "emails_reviewed": len(unseen_emails),
-                    "surfaced": 0,
-                    "suppressed_for_age": len(aged_emails),
-                },
-            )
-            self._complete_poll(user_now)
-            return
+            await session.commit()
 
-        summaries_sent = 0
-        processed_ids: List[str] = [email.id for email in aged_emails]
-
-        for email in eligible_emails:
-            summary = await classify_email_importance(email)
-            processed_ids.append(email.id)
-            if not summary:
-                continue
-
-            summaries_sent += 1
+        for summary in summaries:
             await self._dispatch_summary(summary)
-
-        if processed_ids:
-            self._seen_store.mark_seen(processed_ids)
 
         logger.info(
             "Important email watcher check complete",
             extra={
-                "emails_reviewed": len(unseen_emails),
-                "surfaced": summaries_sent,
-                "suppressed_for_age": len(aged_emails),
+                "user_id": str(ctx.user_id),
+                "emails_reviewed": len(unseen),
+                "surfaced": surfaced,
+                "classify_failures": failed,
+                "suppressed_for_age": len(aged),
             },
         )
-        self._complete_poll(user_now)
+        self._complete(ctx.user_id, now)
+
+    def _split_by_age(
+        self, emails: list[ProcessedEmail], cutoff: datetime
+    ) -> tuple[list[ProcessedEmail], list[ProcessedEmail]]:
+        """Partition into (recent enough to surface, too old).
+
+        Both sides of the comparison are normalised to UTC. The original compared
+        against a value converted into the *user's* timezone and patched naive
+        timestamps with that zone (original ``:171-182``) — a tz-arithmetic path
+        with three branches where one is enough.
+        """
+        eligible: list[ProcessedEmail] = []
+        aged: list[ProcessedEmail] = []
+        for email in emails:
+            stamp = email.timestamp
+            if stamp is None:
+                eligible.append(email)
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            (aged if stamp.astimezone(timezone.utc) < cutoff else eligible).append(email)
+        return eligible, aged
+
+    def _complete(self, user_id: uuid.UUID, moment: datetime) -> None:
+        self._last_poll[user_id] = moment
+        self._seeded.add(user_id)
 
     async def _dispatch_summary(self, summary: str) -> None:
+        """Hand the summary to the interaction agent, inside the tenant scope."""
         runtime = _resolve_interaction_runtime()
         try:
-            contextualized = f"Important email watcher notification:\n{summary}"
-            await runtime.handle_agent_message(contextualized)
+            await runtime.handle_agent_message(
+                f"Important email watcher notification:\n{summary}"
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error(
-                "Failed to dispatch important email summary",
-                extra={"error": str(exc)},
+                "Failed to dispatch important email summary", extra={"error": str(exc)}
             )
 
 
-_watcher_instance: Optional[ImportantEmailWatcher] = None
+_watcher_instance: ImportantEmailWatcher | None = None
 
 
 def get_important_email_watcher() -> ImportantEmailWatcher:
