@@ -125,9 +125,9 @@ def plot_batchsize() -> None:
     bars = ax.bar([i - 0.19 for i in x], jobs, width=0.38, color=ACCENT, label="jobs / sec")
     line = ax2.plot(list(x), commits, "o-", color=WARN, lw=2.2, ms=8, label="commits / sec")
 
-    for i, v in zip(x, jobs):
+    for i, v in zip(x, jobs, strict=True):
         ax.text(i - 0.19, v * 1.04, thousands(v, None), ha="center", color=ACCENT, fontsize=9)
-    for i, v in zip(x, commits):
+    for i, v in zip(x, commits, strict=True):
         off = -0.12 if i == len(commits) - 1 else 0.12
         ha = "right" if i == len(commits) - 1 else "left"
         ax2.text(i + off, v * 1.10, thousands(v, None), ha=ha, color=WARN, fontsize=9)
