@@ -20,11 +20,25 @@ B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; D=$'\033[2m'; O=$'\033[0m'
 step() { echo; echo "${B}=== $* ===${O}"; }
 fail() { echo "${R}FAILED: $*${O}"; cleanup; exit 1; }
 
+# Only ever kill what THIS script started. A blanket `pkill -f server.worker`
+# also kills the worker behind a live demo app, which is a nasty surprise
+# mid-presentation.
+OWN_PIDS=""
 cleanup() {
   pkill -f "uvicorn server.app:app --port $PORT"  2>/dev/null
   pkill -f "uvicorn server.app:app --port $OLDPORT" 2>/dev/null
-  pkill -f "server.worker" 2>/dev/null
+  for pid in $OWN_PIDS; do kill "$pid" 2>/dev/null; done
+  sleep 2
+  # Verify, don't assume: a worker that ignored TERM would otherwise leak and
+  # keep claiming jobs after the demo ends.
+  for pid in $OWN_PIDS; do
+    if kill -0 "$pid" 2>/dev/null; then
+      disown "$pid" 2>/dev/null || true   # suppress the shell's "Killed: 9" notice
+      kill -9 "$pid" 2>/dev/null
+    fi
+  done
   sleep 1
+  wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -37,7 +51,10 @@ wait_for() {  # wait_for <url> <label>
   return 1
 }
 
-cleanup  # start from a known-clean slate
+# Free the ports this script needs, without touching anything else.
+pkill -f "uvicorn server.app:app --port $PORT" 2>/dev/null
+pkill -f "uvicorn server.app:app --port $OLDPORT" 2>/dev/null
+sleep 1
 
 step "0/5  Postgres + migrations"
 make db-up >/dev/null || fail "postgres would not start"
@@ -65,6 +82,7 @@ sleep 1
 step "3/5  AFTER — API + worker on :$PORT"
 $PY -m uvicorn server.app:app --port $PORT >/tmp/demo-api.log 2>&1 &
 $PY -m server.worker >/tmp/demo-worker.log 2>&1 &
+OWN_PIDS="$OWN_PIDS $!"
 wait_for "http://127.0.0.1:$PORT/api/v1/health" "new API" \
   || fail "new API did not start (see /tmp/demo-api.log)"
 
