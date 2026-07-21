@@ -1,0 +1,60 @@
+# OpenPoke local/CI topology.
+#
+# `docker compose up -d postgres` works standalone today and is the database the
+# test suite runs against (tests/conftest.py). The `api` and `worker` services
+# need a Dockerfile (Phase 6) and `server/worker.py` (Phase 2); neither exists
+# yet, which is why postgres is deliberately usable on its own.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: openpoke
+      POSTGRES_PASSWORD: openpoke
+      POSTGRES_DB: openpoke
+    ports:
+      - "5432:5432"
+    volumes:
+      - openpoke_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openpoke -d openpoke"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "server.server"]
+    environment:
+      # Inside the compose network the DB host is the service name, not localhost.
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@postgres:5432/openpoke
+      OPENPOKE_HOST: 0.0.0.0
+      OPENPOKE_PORT: "8001"
+    env_file:
+      - .env
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Phase 2 creates server/worker.py. Until then this service will exit non-zero;
+    # it is not started by `docker compose up postgres`.
+    command: ["python", "-m", "server.worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@postgres:5432/openpoke
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  openpoke_pgdata:
