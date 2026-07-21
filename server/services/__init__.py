@@ -20,10 +20,9 @@ from .gmail import (
     get_important_email_watcher,
     initiate_connect,
 )
+from .timezone_store import TimezoneStore, get_timezone_store
 from .trigger_scheduler import get_trigger_scheduler
 from .triggers import get_trigger_service
-from .timezone_store import TimezoneStore, get_timezone_store
-
 
 __all__ = [
     "ConversationLog",
