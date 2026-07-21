@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse
 from .config import get_settings
 from .logging_config import configure_logging, logger
 from .routes import api_router
-from .services import get_important_email_watcher, get_trigger_scheduler
 
 
 # Register global exception handlers for consistent error responses across the API
@@ -65,22 +64,29 @@ register_exception_handlers(app)
 app.include_router(api_router)
 
 
-@app.on_event("startup")
-# Initialize background services (trigger scheduler and email watcher) when the app starts
-async def _start_trigger_scheduler() -> None:
-    scheduler = get_trigger_scheduler()
-    await scheduler.start()
-    watcher = get_important_email_watcher()
-    await watcher.start()
+# No background loops here, deliberately.
+#
+# The original started the trigger scheduler and the email watcher on startup
+# (`app.py:68-74`), which meant *every* API replica ran them. Two replicas fired
+# every reminder twice and polled every inbox twice; the in-process dedupe set
+# that was supposed to prevent it could not see the other process. Scaling the
+# API — the one thing you do under load — was what broke correctness.
+#
+# Background work now lives in a separate entrypoint and a separate container:
+#
+#     python -m server.worker
+#
+# The API process only accepts work (writes a `jobs` row) and reads state back.
+# That also means the API event loop no longer runs agent code, so Phase 1's
+# sync bridge no longer blocks request handling — it blocks the worker instead.
 
 
 @app.on_event("shutdown")
-# Gracefully shutdown background services when the app stops
-async def _stop_trigger_scheduler() -> None:
-    scheduler = get_trigger_scheduler()
-    await scheduler.stop()
-    watcher = get_important_email_watcher()
-    await watcher.stop()
+async def _dispose_engine() -> None:
+    """Return pooled connections on shutdown."""
+    from .db.engine import dispose_engine
+
+    await dispose_engine()
 
 
 __all__ = ["app"]

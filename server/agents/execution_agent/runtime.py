@@ -2,14 +2,14 @@
 
 import inspect
 import json
-from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-from .agent import ExecutionAgent
-from .tools import get_tool_schemas, get_tool_registry
 from ...config import get_settings
-from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
+from ...openrouter_client import request_chat_completion
+from .agent import ExecutionAgent
+from .tools import get_tool_registry, get_tool_schemas
 
 
 @dataclass
@@ -30,7 +30,15 @@ class ExecutionAgentRuntime:
     # Initialize execution agent runtime with settings, tools, and agent instance
     def __init__(self, agent_name: str):
         settings = get_settings()
-        self.agent = ExecutionAgent(agent_name)
+        # The bleed-stop. This used to be `ExecutionAgent(agent_name)`, which
+        # left conversation_limit at None and loaded the entire per-agent log
+        # into the system prompt on every call — unbounded growth until the
+        # context window is exceeded and every call fails permanently.
+        self.agent = ExecutionAgent(
+            agent_name,
+            conversation_limit=settings.execution_agent_conversation_limit,
+            history_char_budget=settings.execution_agent_history_char_budget,
+        )
         self.api_key = settings.openrouter_api_key
         self.model = settings.execution_agent_model
         self.tool_registry = get_tool_registry(agent_name=agent_name)
