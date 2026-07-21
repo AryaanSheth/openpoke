@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Optional
-
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..logging_config import logger

@@ -1,47 +1,59 @@
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from __future__ import annotations
 
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..auth import CurrentUser
+from ..db.session import get_session
 from ..models import ChatHistoryClearResponse, ChatHistoryResponse, ChatRequest
-from ..services import get_conversation_log, get_trigger_service, handle_chat_request
+from ..repositories.conversation import ConversationRepository, WorkingMemoryRepository
+from ..repositories.execution import AgentLogRepository, AgentRosterRepository
+from ..repositories.triggers import TriggerRepository
+from ..services import handle_chat_request
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-@router.post("/send", response_class=JSONResponse, summary="Submit a chat message and receive a completion")
-# Handle incoming chat messages and route them to the interaction agent
-async def chat_send(
-    payload: ChatRequest,
-) -> JSONResponse:
+@router.post(
+    "/send",
+    response_class=JSONResponse,
+    summary="Submit a chat message and receive a completion",
+)
+async def chat_send(payload: ChatRequest, user: CurrentUser) -> JSONResponse:
+    """The tenant is bound by ``get_current_user`` before this runs, so the
+    detached interaction task inherits it through the context var."""
     return await handle_chat_request(payload)
 
 
 @router.get("/history", response_model=ChatHistoryResponse)
-# Retrieve the conversation history from the log
-def chat_history() -> ChatHistoryResponse:
-    log = get_conversation_log()
-    return ChatHistoryResponse(messages=log.to_chat_messages())
+async def chat_history(
+    user: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> ChatHistoryResponse:
+    """This user's transcript. Reads through the request session rather than the
+    legacy proxy, so it never touches the sync bridge."""
+    repo = ConversationRepository(session, user.id)
+    return ChatHistoryResponse(messages=await repo.to_chat_messages(user.timezone or "UTC"))
 
 
 @router.delete("/history", response_model=ChatHistoryClearResponse)
-def clear_history() -> ChatHistoryClearResponse:
-    from ..services import get_execution_agent_logs, get_agent_roster
+async def clear_history(
+    user: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> ChatHistoryClearResponse:
+    """Clear **this caller's** conversation, working memory, agents, agent logs
+    and triggers — in one transaction.
 
-    # Clear conversation log
-    log = get_conversation_log()
-    log.clear()
-
-    # Clear execution agent logs
-    execution_logs = get_execution_agent_logs()
-    execution_logs.clear_all()
-
-    # Clear agent roster
-    roster = get_agent_roster()
-    roster.clear()
-
-    # Clear stored triggers
-    trigger_service = get_trigger_service()
-    trigger_service.clear_all()
-
+    The original (``routes/chat.py:26-45``) was unauthenticated and wiped the
+    global conversation log, the roster, every execution log and **every trigger
+    in the system**, in four independent non-transactional steps.
+    """
+    await ConversationRepository(session, user.id).clear()
+    await WorkingMemoryRepository(session, user.id).clear()
+    await AgentLogRepository(session, user.id).clear_all()
+    await AgentRosterRepository(session, user.id).clear()
+    await TriggerRepository(session, user.id).clear_all()
     return ChatHistoryClearResponse()
 
 
