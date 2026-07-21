@@ -24,7 +24,14 @@ fail() { echo "${R}FAILED: $*${O}"; cleanup; exit 1; }
 # also kills the worker behind a live demo app, which is a nasty surprise
 # mid-presentation.
 OWN_PIDS=""
+DEMO_EMAIL=""
 cleanup() {
+  # Drop the throwaway tenant this run created (CASCADE takes its jobs with it),
+  # so repeated demos don't accumulate users and orphaned jobs in the dev DB.
+  if [ -n "$DEMO_EMAIL" ]; then
+    docker exec openpoke-postgres-1 psql -U openpoke -d openpoke -Atc \
+      "DELETE FROM users WHERE email = '$DEMO_EMAIL'" >/dev/null 2>&1
+  fi
   pkill -f "uvicorn server.app:app --port $PORT"  2>/dev/null
   pkill -f "uvicorn server.app:app --port $OLDPORT" 2>/dev/null
   for pid in $OWN_PIDS; do kill "$pid" 2>/dev/null; done
@@ -86,7 +93,8 @@ OWN_PIDS="$OWN_PIDS $!"
 wait_for "http://127.0.0.1:$PORT/api/v1/health" "new API" \
   || fail "new API did not start (see /tmp/demo-api.log)"
 
-TOKEN=$($PY -m server.auth create-user --email "demo-$(date +%s)@example.com" 2>/dev/null \
+DEMO_EMAIL="demo-$(date +%s)@example.com"
+TOKEN=$($PY -m server.auth create-user --email "$DEMO_EMAIL" 2>/dev/null \
         | awk '/token:/{print $2}')
 [ -n "$TOKEN" ] || fail "could not mint a token"
 echo "${D}token ${TOKEN:0:20}...${O}"
