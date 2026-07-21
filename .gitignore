@@ -49,3 +49,5 @@ server/plans/
 docs/INTERVIEW.md
 docs/SIMPLE.md
 KEY_REFERENCE.txt
+.demo_token
+docs/COMMANDS.md

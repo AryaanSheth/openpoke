@@ -15,7 +15,7 @@ PSQL    := docker exec openpoke-postgres-1 psql -U openpoke -d openpoke -Atc
 .DEFAULT_GOAL := help
 .PHONY: help db-up db-down migrate test test-once gates token api worker \
         old-tree old-api probe-before probe-after demo demo-auto diagram \
-        preflight clean-demo nuke-old
+        preflight explain cost depth tenancy schema clean-demo nuke-old
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -130,3 +130,35 @@ clean-demo: ## Stop demo API/worker processes
 nuke-old: ## Remove the main worktree
 	-git worktree remove $(OLDTREE) --force 2>/dev/null || true
 	@echo "$(OLDTREE) removed"
+
+# ------------------------------------------------------- presentation helpers
+
+explain: ## Show the claim query using the partial index (seeds rows, then cleans up)
+	@$(PSQL) "INSERT INTO jobs (id, user_id, kind, payload, status, run_at) \
+	  SELECT gen_random_uuid(), (SELECT id FROM users LIMIT 1), 'chat_turn', '{}'::jsonb, 'pending', now() \
+	  FROM generate_series(1,50000)" >/dev/null
+	@$(PSQL) "ANALYZE jobs" >/dev/null
+	@echo "--- 50k pending rows; this is the real claim predicate ---"
+	@$(PSQL) "EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM jobs \
+	  WHERE status='pending' AND run_at<=now() ORDER BY run_at \
+	  FOR UPDATE SKIP LOCKED LIMIT 10" | head -8
+	@$(PSQL) "DELETE FROM jobs" >/dev/null
+	@$(PSQL) "VACUUM jobs" >/dev/null
+	@echo "--- cleaned up ---"
+
+cost: ## Per-model LLM spend recorded by the metering table
+	@$(PSQL) "SELECT model, count(*) AS calls, sum(prompt_tokens) AS tok_in, \
+	  sum(completion_tokens) AS tok_out, \
+	  '\$$'||round((sum(prompt_tokens)*3.0+sum(completion_tokens)*15.0)/1000000,4) AS cost \
+	  FROM llm_usage GROUP BY model" || true
+	@echo "(empty means no chat turn has run yet on this database)"
+
+depth: ## Queue depth by status — the autoscaling signal
+	@$(PSQL) "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY 1" || true
+
+tenancy: ## Prove every tenant-scoped table carries user_id
+	@$(PSQL) "SELECT table_name FROM information_schema.columns \
+	  WHERE column_name='user_id' AND table_schema='public' ORDER BY 1"
+
+schema: ## Indexes on the jobs table, including the partial one
+	@$(PSQL) "SELECT indexdef FROM pg_indexes WHERE tablename='jobs' ORDER BY indexname"
