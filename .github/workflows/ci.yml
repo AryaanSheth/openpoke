@@ -203,6 +203,28 @@ jobs:
     name: load smoke (k6, p95 threshold)
     needs: behavioral
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: openpoke
+          POSTGRES_PASSWORD: openpoke
+          POSTGRES_DB: openpoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openpoke -d openpoke"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://openpoke:openpoke@localhost:5432/openpoke
+      # /chat/send is a pure enqueue, so this measures our endpoint rather than
+      # OpenRouter. The worker is deliberately NOT started: jobs pile up in the
+      # queue and are never executed, which is exactly what we want to measure.
+      OPENROUTER_API_KEY: ci-not-used-chat-send-only-enqueues
+      COMPOSIO_API_KEY: ci-not-used
+      COMPOSIO_GMAIL_AUTH_CONFIG_ID: ci-not-used
     steps:
       - uses: actions/checkout@v7
       - name: Check for a k6 load script
@@ -216,12 +238,46 @@ jobs:
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
-      - name: Run k6 smoke test
+      - uses: actions/setup-python@v7
+        if: steps.check.outputs.present == 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        if: steps.check.outputs.present == 'true'
+        run: |
+          pip install -r server/requirements.txt
+          pip install ".[dev]"
+      - name: Migrate and start the API
+        if: steps.check.outputs.present == 'true'
+        id: stack
+        run: |
+          python -m alembic upgrade head
+          # The token is minted here and only here: it never leaves the runner,
+          # and the account is thrown away with the container.
+          TOKEN=$(python -m server.auth create-user --email ci-load@example.invalid \
+                  | awk '/token:/{print $2}')
+          [ -n "$TOKEN" ] || { echo "::error::could not mint a bearer token"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          python -m uvicorn server.app:app --port 8098 > /tmp/api.log 2>&1 &
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8098/api/v1/health || true)
+            [ "$code" = "200" ] && { echo "api up after ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::API did not become healthy"; cat /tmp/api.log; exit 1
+      - name: Install k6
         if: steps.check.outputs.present == 'true'
         uses: grafana/setup-k6-action@v1
       - name: Execute k6 script
         if: steps.check.outputs.present == 'true'
+        env:
+          BASE_URL: http://127.0.0.1:8098
+          TOKEN: ${{ steps.stack.outputs.token }}
         run: k6 run ${{ steps.check.outputs.script }}
+      - name: API log on failure
+        if: failure() && steps.check.outputs.present == 'true'
+        run: tail -50 /tmp/api.log
       - name: Skip - k6 script not present
         if: steps.check.outputs.present == 'false'
         run: |
